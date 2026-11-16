@@ -105,12 +105,12 @@ that can be handled by a module of type `T`”? One way of dealing with this iss
 is to introduce a private helper trait:
 
 ```rust
-## [async_trait::async_trait]
+#[async_trait::async_trait]
 trait Handlee<T: Module>: Message {
     async fn get_handled(self: Box<Self>, module_ref: &ModuleRef<T>, t: &mut T);
 }
 
-## [async_trait::async_trait]
+#[async_trait::async_trait]
 impl<M: Message, T: Handler<M>> Handlee<T> for M {
     async fn get_handled(self: Box<Self>, module_ref: &ModuleRef<T>, t: &mut T) {
         t.handle(module_ref, *self).await
