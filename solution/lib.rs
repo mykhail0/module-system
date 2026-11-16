@@ -1,14 +1,15 @@
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
 
-use async_channel::{unbounded, Receiver, Sender};
+use async_channel::{Receiver, Sender, unbounded};
+use log::error;
 use tokio::{
     sync::{Mutex, Notify},
     task::JoinHandle,
-    time::{interval_at, Instant},
+    time::{Instant, interval_at},
 };
 
 pub trait Message: Send + 'static {}
@@ -168,7 +169,7 @@ impl System {
 
         for exe in executors {
             if let Err(err) = exe.await {
-                eprintln!("A module executor failed joining, reason: {err}");
+                error!("A module executor failed joining, reason: {err}");
                 if err.is_panic() {
                     panic!("A module executor panicked!");
                 }
@@ -201,14 +202,14 @@ impl System {
             .expect("Shutting down already shut down system");
 
         if let Err(err) = executor.await {
-            eprintln!("System's main task failed joining, reason: {err}");
+            error!("System's main task failed joining, reason: {err}");
             if err.is_panic() {
                 panic!("A module executor panicked!");
             }
         }
 
         if let Err(err) = ticker.await {
-            eprintln!("System's ticker task failed joining, reason: {err}");
+            error!("System's ticker task failed joining, reason: {err}");
         }
 
         // Drop modules which were not run yet.

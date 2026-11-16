@@ -2,7 +2,7 @@
 name = "assignment-1-solution"
 version = "0.1.1"
 authors = ["Filip Plata <fp371335@students.mimuw.edu.pl>", "Wojciech Ciszewski <w.ciszewski2@student.uw.edu.pl>", "Mykhailo Shevchenko <mykhailo.shev@gmail.com>"]
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 async-trait = "0.1"
