@@ -112,7 +112,7 @@ impl System {
             self.finish_tx
                 .send(())
                 .await
-                .expect("Module closure cannot finish by itself");
+                .expect("Module closure cannot finish on its own");
         }
 
         // Shutdown tickers.
@@ -128,9 +128,9 @@ impl System {
             let mut modules = self.modules.lock().await;
             for m in modules.drain(..) {
                 if let Err(err) = m.await {
-                    error!("A module executor failed joining, reason: {err}");
+                    error!("A module closure failed joining, reason: {err}");
                     if err.is_panic() {
-                        panic!("A module executor panicked!");
+                        panic!("A module panicked!");
                     }
                 }
             }
