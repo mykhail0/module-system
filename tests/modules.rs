@@ -1,5 +1,5 @@
-use assignment_1_solution::{Handler, ModuleRef, System};
 use async_channel::{Receiver, Sender, unbounded};
+use module_system::{Handler, ModuleRef, System};
 use ntest::timeout;
 use std::borrow::BorrowMut;
 use std::future::Future;

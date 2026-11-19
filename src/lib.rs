@@ -50,7 +50,7 @@ impl TimerHandle {
     /// `ModuleRef::request_tick()`.
     /// If the ticks are already stopped, do nothing.
     pub async fn stop(&self) {
-        // Does nothing if the channel is already closed.
+        // Do nothing if the channel is already closed.
         let _ = self.stop_ticks.send(()).await;
     }
 }
@@ -86,7 +86,7 @@ impl System {
         {
             let mut modules = self.modules.lock().await;
             modules.push(Box::new(ModuleExecutor {
-                mod_ref: mod_ref.clone(),
+                module_ref: mod_ref.clone(),
                 module,
                 rx,
             }));
@@ -296,7 +296,7 @@ impl<T: Module> Clone for ModuleRef<T> {
 }
 
 struct ModuleExecutor<T: Module> {
-    mod_ref: ModuleRef<T>,
+    module_ref: ModuleRef<T>,
     module: T,
     rx: Receiver<Box<dyn Handlee<T>>>,
 }
@@ -314,8 +314,8 @@ impl<T: Module> Mod for ModuleExecutor<T> {
                 }
                 msg = self.rx.recv() => {
                     let msg = msg
-                        .expect("All ModuleRefs being dropped shouldn't be possible (Mod should owns one)");
-                    msg.get_handled(&self.mod_ref, &mut self.module).await;
+                        .expect("All ModuleRefs being dropped shouldn't be possible (Mod should own one)");
+                    msg.get_handled(&self.module_ref, &mut self.module).await;
                 }
             };
         }
