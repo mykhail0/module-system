@@ -55,7 +55,7 @@ impl TimerHandle {
     }
 }
 
-type Modules = Arc<Mutex<Vec<Box<dyn Mod>>>>;
+type Modules = Arc<Mutex<Vec<Box<dyn Executable>>>>;
 
 pub struct System {
     // Modules whose executors were not launched yet.
@@ -63,14 +63,7 @@ pub struct System {
     finished_or_mod_registered: Arc<Notify>,
     is_finished: Arc<AtomicBool>,
     executor: Option<JoinHandle<()>>,
-    finished: Arc<Notify>,
-    ticker: Option<JoinHandle<()>>,
     ticking_modules: Arc<Mutex<Vec<Sender<()>>>>,
-}
-
-#[async_trait::async_trait]
-trait Mod: Module {
-    async fn execute(self: Box<Self>, finished: Receiver<()>);
 }
 
 impl System {
@@ -99,7 +92,6 @@ impl System {
     pub async fn new() -> Self {
         let modules = Arc::new(Mutex::new(Vec::new()));
         let finished_or_mod_registered = Arc::new(Notify::new());
-        let finished = Arc::new(Notify::new());
         let is_finished = Arc::new(AtomicBool::new(false));
         let ticking_modules = Arc::new(Mutex::new(Vec::new()));
 
@@ -109,18 +101,11 @@ impl System {
             Arc::clone(&is_finished),
         ));
 
-        let ticker = tokio::spawn(Self::shutdown_ticks(
-            Arc::clone(&finished),
-            Arc::clone(&ticking_modules),
-        ));
-
         Self {
             modules,
             finished_or_mod_registered,
             is_finished,
             executor: Some(executor),
-            finished,
-            ticker: Some(ticker),
             ticking_modules,
         }
     }
@@ -177,16 +162,6 @@ impl System {
         }
     }
 
-    // Task, which handles shutting down sending ticks to modules.
-    async fn shutdown_ticks(finished: Arc<Notify>, ticking_modules: Arc<Mutex<Vec<Sender<()>>>>) {
-        // Shutdown ticking modules.
-        finished.notified().await;
-        let mut ticking_modules = ticking_modules.lock().await;
-        for tx in ticking_modules.drain(..) {
-            let _ = tx.send(()).await;
-        }
-    }
-
     /// Gracefully shut the system down.
     pub async fn shutdown(&mut self) {
         self.is_finished.store(true, Ordering::Relaxed);
@@ -195,21 +170,21 @@ impl System {
             .executor
             .take()
             .expect("Shutting down already shut down system");
-        self.finished.notify_one();
-        let ticker = self
-            .ticker
-            .take()
-            .expect("Shutting down already shut down system");
+
+        // Shutdown ticking modules.
+        {
+            let mut ticking_modules = self.ticking_modules.lock().await;
+            for tx in ticking_modules.drain(..) {
+                // TODO some err checking
+                let _ = tx.send(()).await;
+            }
+        }
 
         if let Err(err) = executor.await {
             error!("System's main task failed joining, reason: {err}");
             if err.is_panic() {
                 panic!("A module executor panicked!");
             }
-        }
-
-        if let Err(err) = ticker.await {
-            error!("System's ticker task failed joining, reason: {err}");
         }
 
         // Drop modules which were not run yet.
@@ -252,8 +227,7 @@ impl<T: Module> ModuleRef<T> {
         T: Handler<M>,
     {
         let (tx, rx) = unbounded();
-        let self_clone = self.clone();
-        tokio::spawn(self_clone.tick(message, delay, rx));
+        tokio::spawn(self.clone().tick(message, delay, rx));
         let mut ticking_modules = self.ticking_modules.lock().await;
         ticking_modules.push(tx.clone());
         TimerHandle { stop_ticks: tx }
@@ -301,20 +275,28 @@ struct ModuleExecutor<T: Module> {
     rx: Receiver<Box<dyn Handlee<T>>>,
 }
 
+// TODO is there a naming convention for such case? ModuleExecutor <-> Executable correspondence
+// the only reason this is a trait is because ModuleExecutor needs to be dyn
 #[async_trait::async_trait]
-impl<T: Module> Mod for ModuleExecutor<T> {
+trait Executable: Send + 'static {
+    async fn execute(self: Box<Self>, finished: Receiver<()>);
+}
+
+#[async_trait::async_trait]
+impl<T: Module> Executable for ModuleExecutor<T> {
+    // TODO why is the signature different from the one above with mut?
     async fn execute(mut self: Box<Self>, finished: Receiver<()>) {
         loop {
             tokio::select! {
                 biased;
 
                 f = finished.recv() => {
-                    f.expect("Finishing channel shouldn't close");
+                    f.expect("`finished` channel shouldn't close");
                     break;
                 }
                 msg = self.rx.recv() => {
                     let msg = msg
-                        .expect("All ModuleRefs being dropped shouldn't be possible (Mod should own one)");
+                        .expect("The channel cannot close unless all ModuleRefs are dropped, and `self` owns one.");
                     msg.get_handled(&self.module_ref, &mut self.module).await;
                 }
             };
