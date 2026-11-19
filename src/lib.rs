@@ -1,13 +1,10 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_channel::{Receiver, Sender, unbounded};
 use log::error;
 use tokio::{
-    sync::{Mutex, Notify},
+    sync::Mutex,
     task::JoinHandle,
     time::{Instant, interval_at},
 };
@@ -55,154 +52,96 @@ impl TimerHandle {
     }
 }
 
-type Modules = Arc<Mutex<Vec<Box<dyn Executable>>>>;
-
 pub struct System {
-    // Modules whose executors were not launched yet.
-    modules: Modules,
-    finished_or_mod_registered: Arc<Notify>,
-    is_finished: Arc<AtomicBool>,
-    executor: Option<JoinHandle<()>>,
-    ticking_modules: Arc<Mutex<Vec<Sender<()>>>>,
+    modules: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    finish_tx: Sender<()>,
+    finish_rx: Receiver<()>,
+    timer_handles: Arc<Mutex<Vec<TimerHandle>>>,
 }
 
 impl System {
     /// Register a given module in the system. Return a `ModuleRef`, which can
     /// be used then to send messages to the module.
-    pub async fn register_module<T: Module>(&mut self, module: T) -> ModuleRef<T> {
+    pub async fn register_module<T: Module>(&mut self, mut module: T) -> ModuleRef<T> {
         let (tx, rx) = unbounded();
-        let ticking_modules = Arc::clone(&self.ticking_modules);
-        let mod_ref = ModuleRef {
-            tx,
-            ticking_modules,
-        };
-        {
-            let mut modules = self.modules.lock().await;
-            modules.push(Box::new(ModuleExecutor {
-                module_ref: mod_ref.clone(),
-                module,
-                rx,
-            }));
-        }
-        self.finished_or_mod_registered.notify_one();
-        mod_ref
+        let timer_handles = Arc::clone(&self.timer_handles);
+        let module_ref = ModuleRef { tx, timer_handles };
+        let mut modules = self.modules.lock().await;
+        modules.push(tokio::spawn({
+            let module_ref = module_ref.clone();
+            let finish_rx = self.finish_rx.clone();
+            async move { loop {
+                tokio::select! {
+                    biased;
+
+                    f = finish_rx.recv() => {
+                        f.expect("`finished` channel shouldn't close");
+                        break;
+                    }
+                    msg = rx.recv() => {
+                        let msg = msg
+                            .expect("Message channel cannot close unless all ModuleRefs are dropped, and this closure owns one.");
+                        msg.get_handled(&module_ref, &mut module).await;
+                    }
+                };
+            }}
+        }));
+        module_ref
     }
 
     /// Create and start a new instance of the system.
     pub async fn new() -> Self {
         let modules = Arc::new(Mutex::new(Vec::new()));
-        let finished_or_mod_registered = Arc::new(Notify::new());
-        let is_finished = Arc::new(AtomicBool::new(false));
-        let ticking_modules = Arc::new(Mutex::new(Vec::new()));
-
-        let executor = tokio::spawn(Self::execute(
-            Arc::clone(&modules),
-            Arc::clone(&finished_or_mod_registered),
-            Arc::clone(&is_finished),
-        ));
-
+        let (finish_tx, finish_rx) = unbounded();
+        let timer_handles = Arc::new(Mutex::new(Vec::new()));
         Self {
             modules,
-            finished_or_mod_registered,
-            is_finished,
-            executor: Some(executor),
-            ticking_modules,
-        }
-    }
-
-    // Main system's task, which lets modules handle their messages.
-    async fn execute(
-        added: Modules,
-        finished_or_mod_registered: Arc<Notify>,
-        is_finished: Arc<AtomicBool>,
-    ) {
-        let mut executors = Vec::new();
-        let (tx, rx) = unbounded();
-
-        loop {
-            finished_or_mod_registered.notified().await;
-            if is_finished.load(Ordering::Relaxed) {
-                Self::finished(tx, executors).await;
-                break;
-            } else {
-                Self::mod_registered(&mut executors, &added, &rx).await;
-            }
-        }
-    }
-
-    async fn mod_registered(
-        executors: &mut Vec<JoinHandle<()>>,
-        added: &Modules,
-        rx: &Receiver<()>,
-    ) {
-        let mut new_modules = added.lock().await;
-        executors.extend(
-            new_modules
-                .drain(..)
-                .map(|m| tokio::spawn(m.execute(rx.clone()))),
-        );
-    }
-
-    async fn finished(tx: Sender<()>, executors: Vec<JoinHandle<()>>) {
-        let cnt = tx.receiver_count();
-        for _ in 1..cnt {
-            // 1 receiver is for cloning in Self::execute()
-            tx.send(())
-                .await
-                .expect("Executor should not have been dropped");
-        }
-
-        for exe in executors {
-            if let Err(err) = exe.await {
-                error!("A module executor failed joining, reason: {err}");
-                if err.is_panic() {
-                    panic!("A module executor panicked!");
-                }
-            }
+            finish_tx,
+            finish_rx,
+            timer_handles,
         }
     }
 
     /// Gracefully shut the system down.
     pub async fn shutdown(&mut self) {
-        self.is_finished.store(true, Ordering::Relaxed);
-        self.finished_or_mod_registered.notify_one();
-        let executor = self
-            .executor
-            .take()
-            .expect("Shutting down already shut down system");
+        let cnt = self.finish_tx.receiver_count();
+        // Signal the shutdown for everybody.
+        // TODO think of data races when someone registers a module
+        for _ in 1..cnt {
+            // Leave 1 finish_rx alive for further cloning when registering modules.
+            self.finish_tx
+                .send(())
+                .await
+                .expect("Module closure cannot finish by itself");
+        }
 
-        // Shutdown ticking modules.
+        // Shutdown tickers.
         {
-            let mut ticking_modules = self.ticking_modules.lock().await;
-            for tx in ticking_modules.drain(..) {
-                // TODO some err checking
-                let _ = tx.send(()).await;
+            let mut timer_handles = self.timer_handles.lock().await;
+            for handle in timer_handles.drain(..) {
+                handle.stop().await;
             }
         }
 
-        if let Err(err) = executor.await {
-            error!("System's main task failed joining, reason: {err}");
-            if err.is_panic() {
-                panic!("A module executor panicked!");
+        // Await module completion.
+        {
+            let mut modules = self.modules.lock().await;
+            for m in modules.drain(..) {
+                if let Err(err) = m.await {
+                    error!("A module executor failed joining, reason: {err}");
+                    if err.is_panic() {
+                        panic!("A module executor panicked!");
+                    }
+                }
             }
         }
-
-        // Drop modules which were not run yet.
-        // An already run module `m` is going to get dropped
-        // once `m.execute(finished_rx)` finishes.
-        self.drop_modules().await;
-    }
-
-    async fn drop_modules(&mut self) {
-        let mut modules = self.modules.lock().await;
-        modules.clear();
     }
 }
 
 /// A reference to a module used for sending messages.
 pub struct ModuleRef<T: Module + ?Sized> {
     tx: Sender<Box<dyn Handlee<T>>>,
-    ticking_modules: Arc<Mutex<Vec<Sender<()>>>>,
+    timer_handles: Arc<Mutex<Vec<TimerHandle>>>,
 }
 
 impl<T: Module> ModuleRef<T> {
@@ -228,8 +167,10 @@ impl<T: Module> ModuleRef<T> {
     {
         let (tx, rx) = unbounded();
         tokio::spawn(self.clone().tick(message, delay, rx));
-        let mut ticking_modules = self.ticking_modules.lock().await;
-        ticking_modules.push(tx.clone());
+        let mut timer_handles = self.timer_handles.lock().await;
+        timer_handles.push(TimerHandle {
+            stop_ticks: tx.clone(),
+        });
         TimerHandle { stop_ticks: tx }
     }
 
@@ -247,7 +188,7 @@ impl<T: Module> ModuleRef<T> {
                 biased;
 
                 f = rx.recv() => {
-                    f.expect("Finishing channel shouldn't close (System should have a reference)");
+                    f.expect("`finish` channel shouldn't close on System's end");
                     break;
                 }
                 _ = interval.tick() => {
@@ -264,42 +205,7 @@ impl<T: Module> Clone for ModuleRef<T> {
     fn clone(&self) -> Self {
         Self {
             tx: self.tx.clone(),
-            ticking_modules: Arc::clone(&self.ticking_modules),
-        }
-    }
-}
-
-struct ModuleExecutor<T: Module> {
-    module_ref: ModuleRef<T>,
-    module: T,
-    rx: Receiver<Box<dyn Handlee<T>>>,
-}
-
-// TODO is there a naming convention for such case? ModuleExecutor <-> Executable correspondence
-// the only reason this is a trait is because ModuleExecutor needs to be dyn
-#[async_trait::async_trait]
-trait Executable: Send + 'static {
-    async fn execute(self: Box<Self>, finished: Receiver<()>);
-}
-
-#[async_trait::async_trait]
-impl<T: Module> Executable for ModuleExecutor<T> {
-    // TODO why is the signature different from the one above with mut?
-    async fn execute(mut self: Box<Self>, finished: Receiver<()>) {
-        loop {
-            tokio::select! {
-                biased;
-
-                f = finished.recv() => {
-                    f.expect("`finished` channel shouldn't close");
-                    break;
-                }
-                msg = self.rx.recv() => {
-                    let msg = msg
-                        .expect("The channel cannot close unless all ModuleRefs are dropped, and `self` owns one.");
-                    msg.get_handled(&self.module_ref, &mut self.module).await;
-                }
-            };
+            timer_handles: Arc::clone(&self.timer_handles),
         }
     }
 }
