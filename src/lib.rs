@@ -54,6 +54,7 @@ impl TimerHandle {
 
 pub struct System {
     modules: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    // Channel to inform when the system is shut down.
     finish_tx: Sender<()>,
     finish_rx: Receiver<()>,
     timer_handles: Arc<Mutex<Vec<TimerHandle>>>,
@@ -103,37 +104,50 @@ impl System {
     }
 
     /// Gracefully shut the system down.
+    ///
+    /// The shutdown waits for all already started handlers to finish and for
+    /// all registered modules to be dropped. It does not wait for all enqueued
+    /// messages to be handled. It does not wait for all Tokio tasks to finish,
+    /// but it causes all of them to finish (for example, a task handling
+    /// `ModuleRef::request_tick()` may finish an interval after the shutdown).
+    /// It is undefined what happens when the system is used after shutdown.
+    /// However, a shutdown will not cause any panics in handlers or Tokio
+    /// tasks.
     pub async fn shutdown(&mut self) {
         let cnt = self.finish_tx.receiver_count();
         // Signal the shutdown for everybody.
-        // TODO think of data races when someone registers a module
         for _ in 1..cnt {
-            // Leave 1 finish_rx alive for further cloning when registering modules.
+            // Leave 1 `finish_rx` alive for further cloning when registering modules.
             self.finish_tx
                 .send(())
                 .await
                 .expect("Module closure cannot finish on its own");
         }
 
-        // Shutdown tickers.
+        // Signal tickers to shutdown.
         {
             let mut timer_handles = self.timer_handles.lock().await;
-            for handle in timer_handles.drain(..) {
-                handle.stop().await;
+            for ticker in timer_handles.drain(..) {
+                ticker.stop().await;
             }
         }
 
         // Await module completion.
+        let mut panic = false;
         {
             let mut modules = self.modules.lock().await;
-            for m in modules.drain(..) {
-                if let Err(err) = m.await {
+            for module in modules.drain(..) {
+                if let Err(err) = module.await {
                     error!("A module closure failed joining, reason: {err}");
                     if err.is_panic() {
-                        panic!("A module panicked!");
+                        panic = true;
                     }
                 }
             }
+        }
+        // Panic if a registered module panics.
+        if panic {
+            panic!("A module panicked!");
         }
     }
 }
@@ -150,6 +164,7 @@ impl<T: Module> ModuleRef<T> {
     where
         T: Handler<M>,
     {
+        // TODO more graceful handling of sending a message after the shutdown
         self.tx
             .send(Box::new(msg))
             .await
@@ -188,12 +203,11 @@ impl<T: Module> ModuleRef<T> {
                 biased;
 
                 f = rx.recv() => {
-                    f.expect("`finish` channel shouldn't close on System's end");
+                    f.expect("`finish` channel shouldn't close on `System`'s end");
                     break;
                 }
                 _ = interval.tick() => {
-                    let m = message.clone();
-                    self.send(m).await;
+                    self.send(message.clone()).await;
                 }
             };
         }

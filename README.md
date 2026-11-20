@@ -47,13 +47,13 @@ a shutdown will not cause any panics in handlers or Tokio tasks.
 The `Message` trait defines what is expected from messages in the module system.
 It is also possible to use `ModuleRef` as `Message`.
 
-The file [`public-tests/tests/modules.rs`](public-tests/tests/modules.rs)
-contains an example of how the module system can be used. In the example there
-are two modules: `Ping` and `Pong`. After being registered in the system, they
-are sent references to each other so that they can communicate. Then one of the
-modules sends a `Ball` message to the other module. That module replies to it
-with a new `Ball` message, to which the first module replies with the next
-`Ball` message, and so forth.
+The file [`tests/modules.rs`](tests/modules.rs) contains an example of how the
+module system can be used. In the example there are two modules: `Ping` and
+`Pong`. After being registered in the system, they are sent references to each
+other so that they can communicate. Then one of the modules sends a `Ball`
+message to the other module. That module replies to it with a new `Ball`
+message, to which the first module replies with the next `Ball` message, and so
+forth.
 
 ### Additional requirements
 
