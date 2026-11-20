@@ -1,10 +1,8 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_channel::{Receiver, Sender, unbounded};
 use log::error;
 use tokio::{
-    sync::Mutex,
     task::JoinHandle,
     time::{Instant, interval_at},
 };
@@ -57,7 +55,6 @@ pub struct System {
     // Channel to inform when the system is shut down.
     finish_tx: Sender<()>,
     finish_rx: Receiver<()>,
-    timer_handles: Arc<Mutex<Vec<TimerHandle>>>,
 }
 
 impl System {
@@ -65,8 +62,10 @@ impl System {
     /// be used then to send messages to the module.
     pub async fn register_module<T: Module>(&mut self, mut module: T) -> ModuleRef<T> {
         let (tx, rx) = unbounded();
-        let timer_handles = Arc::clone(&self.timer_handles);
-        let module_ref = ModuleRef { tx, timer_handles };
+        let module_ref = ModuleRef {
+            tx,
+            finish_rx: self.finish_rx.clone(),
+        };
         self.modules.push(tokio::spawn({
             let module_ref = module_ref.clone();
             let finish_rx = self.finish_rx.clone();
@@ -74,8 +73,7 @@ impl System {
                 // Should be cancellation safe with 2 unbounded recv
                 tokio::select! {
                     biased;
-                    f = finish_rx.recv() => {
-                        f.expect("`finished` channel shouldn't close");
+                    _ = finish_rx.recv() => {
                         break;
                     }
                     msg = rx.recv() => {
@@ -93,12 +91,10 @@ impl System {
     pub async fn new() -> Self {
         let modules = Vec::new();
         let (finish_tx, finish_rx) = unbounded();
-        let timer_handles = Arc::new(Mutex::new(Vec::new()));
         Self {
             modules,
             finish_tx,
             finish_rx,
-            timer_handles,
         }
     }
 
@@ -115,23 +111,8 @@ impl System {
     ///
     /// Not cancel-safe.
     pub async fn shutdown(&mut self) {
-        let cnt = self.finish_tx.receiver_count();
         // Signal the shutdown for everybody.
-        for _ in 1..cnt {
-            // Leave 1 `finish_rx` alive for further cloning when registering modules.
-            self.finish_tx
-                .send(())
-                .await
-                .expect("Module closure cannot finish on its own");
-        }
-
-        // Signal tickers to shutdown.
-        {
-            let mut timer_handles = self.timer_handles.lock().await;
-            for ticker in timer_handles.drain(..) {
-                ticker.stop().await;
-            }
-        }
+        self.finish_tx.close();
 
         // Await module completion.
         let mut panic = false;
@@ -153,7 +134,7 @@ impl System {
 /// A reference to a module used for sending messages.
 pub struct ModuleRef<T: Module + ?Sized> {
     tx: Sender<Box<dyn Handlee<T>>>,
-    timer_handles: Arc<Mutex<Vec<TimerHandle>>>,
+    finish_rx: Receiver<()>,
 }
 
 impl<T: Module> ModuleRef<T> {
@@ -177,12 +158,6 @@ impl<T: Module> ModuleRef<T> {
         T: Handler<M>,
     {
         let (tx, rx) = unbounded();
-        {
-            let mut timer_handles = self.timer_handles.lock().await;
-            timer_handles.push(TimerHandle {
-                stop_ticks: tx.clone(),
-            });
-        }
         tokio::spawn(self.clone().tick(message, delay, rx));
         TimerHandle { stop_ticks: tx }
     }
@@ -195,13 +170,33 @@ impl<T: Module> ModuleRef<T> {
     {
         let start = Instant::now() + delay;
         let mut interval = interval_at(start, delay);
-        loop {
-            // Should be cancellation safe with tokio::tick and unbounded recv
+        let mut finish = false;
+        while !finish {
+            // Should be cancellation safe with tokio::tick and async_channel recv
             tokio::select! {
                 biased;
                 f = rx.recv() => {
-                    f.expect("`finish` channel shouldn't close on `System`'s end");
-                    break;
+                    if f.is_ok() {
+                        finish = true;
+                    } else {
+                        break;
+                    }
+                }
+                _ = self.finish_rx.recv() => {
+                    finish = true;
+                }
+                _ = interval.tick() => {
+                    self.send(message.clone()).await;
+                }
+            };
+        }
+        // If the TimerHandle was dropped, we continue without waiting for `stop`.
+        while !finish {
+            // Should be cancellation safe with tokio::tick and async_channel recv
+            tokio::select! {
+                biased;
+                _ = self.finish_rx.recv() => {
+                    finish = true;
                 }
                 _ = interval.tick() => {
                     self.send(message.clone()).await;
@@ -216,7 +211,7 @@ impl<T: Module> Clone for ModuleRef<T> {
     fn clone(&self) -> Self {
         Self {
             tx: self.tx.clone(),
-            timer_handles: Arc::clone(&self.timer_handles),
+            finish_rx: self.finish_rx.clone(),
         }
     }
 }
