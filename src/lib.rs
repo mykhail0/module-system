@@ -113,6 +113,8 @@ impl System {
     /// It is undefined what happens when the system is used after shutdown.
     /// However, a shutdown will not cause any panics in handlers or Tokio
     /// tasks.
+    ///
+    /// Not cancel-safe.
     pub async fn shutdown(&mut self) {
         let cnt = self.finish_tx.receiver_count();
         // Signal the shutdown for everybody.
@@ -179,11 +181,13 @@ impl<T: Module> ModuleRef<T> {
         T: Handler<M>,
     {
         let (tx, rx) = unbounded();
+        {
+            let mut timer_handles = self.timer_handles.lock().await;
+            timer_handles.push(TimerHandle {
+                stop_ticks: tx.clone(),
+            });
+        }
         tokio::spawn(self.clone().tick(message, delay, rx));
-        let mut timer_handles = self.timer_handles.lock().await;
-        timer_handles.push(TimerHandle {
-            stop_ticks: tx.clone(),
-        });
         TimerHandle { stop_ticks: tx }
     }
 
