@@ -232,3 +232,49 @@ async fn stopping_ticks_works() {
 
     system.shutdown().await;
 }
+
+struct LateSender {
+    other: Option<ModuleRef<LateSender>>,
+}
+
+struct InitLateSender {
+    target: ModuleRef<LateSender>,
+}
+
+#[async_trait::async_trait]
+impl Handler<InitLateSender> for LateSender {
+    async fn handle(&mut self, _self_ref: &ModuleRef<Self>, msg: InitLateSender) {
+        self.other = Some(msg.target);
+    }
+}
+
+#[async_trait::async_trait]
+impl Handler<Ball> for LateSender {
+    async fn handle(&mut self, self_ref: &ModuleRef<Self>, _msg: Ball) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        self.other
+            .as_ref()
+            .unwrap()
+            .send(InitLateSender {
+                target: self_ref.clone(),
+            })
+            .await;
+    }
+}
+
+#[tokio::test]
+#[timeout(300)]
+async fn shutdown_doesnt_panic() {
+    let mut system = System::new().await;
+    let first_module = system.register_module(LateSender { other: None }).await;
+    let second_module = system.register_module(LateSender { other: None }).await;
+    second_module
+        .send(InitLateSender {
+            target: first_module,
+        })
+        .await;
+    second_module.send(Ball).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    system.shutdown().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}

@@ -164,11 +164,9 @@ impl<T: Module> ModuleRef<T> {
     where
         T: Handler<M>,
     {
-        // TODO more graceful handling of sending a message after the shutdown
-        self.tx
-            .send(Box::new(msg))
-            .await
-            .expect("Sending a message after the system shut down.");
+        if let Err(err) = self.tx.send(Box::new(msg)).await {
+            error!("ModuleRef trying to send a message to a closed channel: {err}");
+        }
     }
 
     /// Schedule a message to be sent to the module periodically with the given
