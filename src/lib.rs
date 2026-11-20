@@ -72,9 +72,9 @@ impl System {
             let module_ref = module_ref.clone();
             let finish_rx = self.finish_rx.clone();
             async move { loop {
+                // Should be cancellation safe with 2 unbounded recv
                 tokio::select! {
                     biased;
-
                     f = finish_rx.recv() => {
                         f.expect("`finished` channel shouldn't close");
                         break;
@@ -195,11 +195,10 @@ impl<T: Module> ModuleRef<T> {
     {
         let start = Instant::now() + delay;
         let mut interval = interval_at(start, delay);
-
         loop {
+            // Should be cancellation safe with tokio::tick and unbounded recv
             tokio::select! {
                 biased;
-
                 f = rx.recv() => {
                     f.expect("`finish` channel shouldn't close on `System`'s end");
                     break;

@@ -68,6 +68,8 @@ and actual number of ticks sent so far in any moment after
 The module system does not panic unless a registered module panics (because of a
 user-provided message handler).
 
+Modules are not removed when all `ModuleRef`'s are dropped.
+
 ## Message type
 
 There is a question of what type to use for “some message that can be handled by
