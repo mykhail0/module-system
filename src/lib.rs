@@ -53,7 +53,7 @@ impl TimerHandle {
 }
 
 pub struct System {
-    modules: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    modules: Vec<JoinHandle<()>>,
     // Channel to inform when the system is shut down.
     finish_tx: Sender<()>,
     finish_rx: Receiver<()>,
@@ -67,8 +67,7 @@ impl System {
         let (tx, rx) = unbounded();
         let timer_handles = Arc::clone(&self.timer_handles);
         let module_ref = ModuleRef { tx, timer_handles };
-        let mut modules = self.modules.lock().await;
-        modules.push(tokio::spawn({
+        self.modules.push(tokio::spawn({
             let module_ref = module_ref.clone();
             let finish_rx = self.finish_rx.clone();
             async move { loop {
@@ -92,7 +91,7 @@ impl System {
 
     /// Create and start a new instance of the system.
     pub async fn new() -> Self {
-        let modules = Arc::new(Mutex::new(Vec::new()));
+        let modules = Vec::new();
         let (finish_tx, finish_rx) = unbounded();
         let timer_handles = Arc::new(Mutex::new(Vec::new()));
         Self {
@@ -136,14 +135,11 @@ impl System {
 
         // Await module completion.
         let mut panic = false;
-        {
-            let mut modules = self.modules.lock().await;
-            for module in modules.drain(..) {
-                if let Err(err) = module.await {
-                    error!("A module closure failed joining, reason: {err}");
-                    if err.is_panic() {
-                        panic = true;
-                    }
+        for module in self.modules.drain(..) {
+            if let Err(err) = module.await {
+                error!("A module closure failed joining, reason: {err}");
+                if err.is_panic() {
+                    panic = true;
                 }
             }
         }
